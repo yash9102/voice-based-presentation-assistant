@@ -83,5 +83,3 @@ FastAPI Backend
 | `speaking` | purple pulsing + rings | AI narrating |
 | `listening` | green breathing | Waiting for user |
 | `thinking` | yellow spinning | Processing user input |
-
-
