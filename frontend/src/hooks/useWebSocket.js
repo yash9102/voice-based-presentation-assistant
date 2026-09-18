@@ -1,8 +1,13 @@
 import { useRef, useCallback, useEffect } from 'react'
 
+const RECONNECT_BASE_MS = 500
+const RECONNECT_MAX_MS = 15_000
+
 export function useWebSocket({ onMessage, onOpen, onClose } = {}) {
   const wsRef = useRef(null)
   const reconnectTimer = useRef(null)
+  const shouldReconnect = useRef(true)
+  const attemptRef = useRef(0)
   const onMessageRef = useRef(onMessage)
   const onOpenRef = useRef(onOpen)
   const onCloseRef = useRef(onClose)
@@ -17,7 +22,10 @@ export function useWebSocket({ onMessage, onOpen, onClose } = {}) {
     const ws = new WebSocket(`${protocol}//${window.location.host}/ws`)
     wsRef.current = ws
 
-    ws.onopen = () => onOpenRef.current?.()
+    ws.onopen = () => {
+      attemptRef.current = 0
+      onOpenRef.current?.()
+    }
     ws.onmessage = (e) => {
       try {
         onMessageRef.current?.(JSON.parse(e.data))
@@ -26,8 +34,12 @@ export function useWebSocket({ onMessage, onOpen, onClose } = {}) {
       }
     }
     ws.onclose = () => {
+      // Unmount closes the socket too — don't resurrect it afterwards.
+      if (!shouldReconnect.current) return
       onCloseRef.current?.()
-      reconnectTimer.current = setTimeout(connect, 3000)
+      const delay = Math.min(RECONNECT_BASE_MS * 2 ** attemptRef.current, RECONNECT_MAX_MS)
+      attemptRef.current += 1
+      reconnectTimer.current = setTimeout(connect, delay)
     }
     ws.onerror = (err) => console.error('WebSocket error', err)
   }, [])
@@ -39,8 +51,10 @@ export function useWebSocket({ onMessage, onOpen, onClose } = {}) {
   }, [])
 
   useEffect(() => {
+    shouldReconnect.current = true
     connect()
     return () => {
+      shouldReconnect.current = false
       clearTimeout(reconnectTimer.current)
       wsRef.current?.close()
     }

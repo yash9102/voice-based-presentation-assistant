@@ -128,9 +128,20 @@ class AgentSession:
         self.current_slide: int = 0
         self.presented: set[int] = set()   # which slides the AI has narrated
         self.history: list[dict] = []
+        self.req_id = None   # echoed back so the client can discard stale output
 
     def cancel(self):
         self.cancel_token.cancel()
+
+    def _clamp(self, idx: int) -> int:
+        if not self.slides:
+            return 0
+        return max(0, min(int(idx), len(self.slides) - 1))
+
+    async def _send(self, ws, payload: dict):
+        if self.req_id is not None:
+            payload = {**payload, "req_id": self.req_id}
+        await ws.send_json(payload)
 
     async def handle(self, ws, msg: dict):
         t = msg.get("type")
@@ -139,32 +150,36 @@ class AgentSession:
             self.cancel_token.cancel()
             return
 
+        self.req_id = msg.get("req_id")
+        # A new request always supersedes whatever was interrupted before it.
+        self.cancel_token.reset()
+
         if t == "start_presentation":
             self.slides = msg.get("slides", [])
-            self.current_slide = msg.get("slide", 0)
+            self.current_slide = self._clamp(msg.get("slide", 0))
             await self._narrate_slide(ws, self.current_slide)
 
         elif t == "navigate_request":
-            idx = msg.get("slide", 0)
+            idx = self._clamp(msg.get("slide", 0))
             self.current_slide = idx
             await self._narrate_slide(ws, idx)
 
         elif t == "user_input":
-            self.current_slide = msg.get("current_slide", self.current_slide)
+            self.current_slide = self._clamp(msg.get("current_slide", self.current_slide))
             user_text = msg.get("text", "").strip()
             intent = detect_present_intent(user_text)
 
             if intent == "all":
                 await self._send_text(ws, "Absolutely! Let me take you through the whole presentation from the start.")
-                await ws.send_json({"type": "speech_end"})
-                await ws.send_json({"type": "start_auto_present", "from_slide": 0})
+                await self._send(ws, {"type": "speech_end"})
+                await self._send(ws, {"type": "start_auto_present", "from_slide": 0})
 
             elif intent == "from_here":
                 n = self.current_slide + 1
                 suffix = "the rest of the presentation" if self.current_slide > 0 else "the presentation"
                 await self._send_text(ws, f"Sure, let me continue with {suffix} from slide {n}.")
-                await ws.send_json({"type": "speech_end"})
-                await ws.send_json({"type": "start_auto_present", "from_slide": self.current_slide})
+                await self._send(ws, {"type": "speech_end"})
+                await self._send(ws, {"type": "start_auto_present", "from_slide": self.current_slide})
 
             else:
                 await self._agent_response(ws, user_text)
@@ -174,7 +189,7 @@ class AgentSession:
         for i, s in enumerate(sentences):
             if self.cancel_token.is_cancelled:
                 return
-            await ws.send_json({"type": "text_chunk", "text": s, "is_final": i == len(sentences) - 1})
+            await self._send(ws, {"type": "text_chunk", "text": s, "is_final": i == len(sentences) - 1})
 
     async def _narrate_slide(self, ws, idx: int):
         self.cancel_token.reset()
@@ -189,12 +204,12 @@ class AgentSession:
         for i, sentence in enumerate(sentences):
             if self.cancel_token.is_cancelled:
                 return
-            await ws.send_json({
+            await self._send(ws, {
                 "type": "text_chunk",
                 "text": sentence,
                 "is_final": i == len(sentences) - 1,
             })
-        await ws.send_json({"type": "speech_end"})
+        await self._send(ws, {"type": "speech_end"})
 
     def _build_system(self) -> str:
         current = self.slides[self.current_slide] if self.slides else {}
@@ -218,7 +233,7 @@ class AgentSession:
 
     async def _agent_response(self, ws, user_text: str):
         self.cancel_token.reset()
-        await ws.send_json({"type": "thinking", "active": True})
+        await self._send(ws, {"type": "thinking", "active": True})
 
         self.history.append({"role": "user", "content": user_text})
         if len(self.history) > 24:
@@ -245,10 +260,10 @@ class AgentSession:
                 if delta:
                     full_response += delta
         except Exception as e:
-            await ws.send_json({"type": "error", "message": str(e)})
+            await self._send(ws, {"type": "error", "message": str(e)})
             return
         finally:
-            await ws.send_json({"type": "thinking", "active": False})
+            await self._send(ws, {"type": "thinking", "active": False})
 
         if self.cancel_token.is_cancelled:
             return
@@ -256,29 +271,29 @@ class AgentSession:
         try:
             data = json.loads(full_response)
         except json.JSONDecodeError:
-            await ws.send_json({"type": "error", "message": "Could not parse AI response"})
+            await self._send(ws, {"type": "error", "message": "Could not parse AI response"})
             return
 
         navigate_to = data.get("navigate_to")
         if navigate_to is not None:
-            target = max(0, min(int(navigate_to) - 1, len(self.slides) - 1))
+            target = self._clamp(int(navigate_to) - 1)
             self.current_slide = target
             self.presented.add(target)
-            await ws.send_json({"type": "navigate", "slide": target, "reason": "user question"})
+            await self._send(ws, {"type": "navigate", "slide": target, "reason": "user question"})
 
         response_text = data.get("response", "")
         sentences = split_sentences(response_text)
         for i, sentence in enumerate(sentences):
             if self.cancel_token.is_cancelled:
                 return
-            await ws.send_json({
+            await self._send(ws, {
                 "type": "text_chunk",
                 "text": sentence,
                 "is_final": i == len(sentences) - 1,
             })
 
         self.history.append({"role": "assistant", "content": response_text})
-        await ws.send_json({"type": "speech_end"})
+        await self._send(ws, {"type": "speech_end"})
 
 
 

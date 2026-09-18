@@ -20,6 +20,11 @@ export default function Present() {
   const slidesRef = useRef(slides)
   const isAutoPresenting = useRef(false)
 
+  // Every request carries an id the backend echoes back. Interrupting bumps it,
+  // so any chunks already in flight for the abandoned turn are discarded.
+  const reqIdRef = useRef(0)
+  const nextReqId = () => ++reqIdRef.current
+
   useEffect(() => { speechStateRef.current = speechState }, [speechState])
   useEffect(() => { currentSlideRef.current = currentSlide }, [currentSlide])
   useEffect(() => { slidesRef.current = slides }, [slides])
@@ -33,6 +38,7 @@ export default function Present() {
     if (s === 'thinking' || s === 'idle' || s === 'listening') return
     isAutoPresenting.current = false
     speech.stopSpeaking()
+    nextReqId()
     ws.send({ type: 'interrupt' })
     dispatch({ type: 'SET_SPEECH_STATE', payload: 'listening' })
     dispatch({ type: 'SET_STATUS', payload: 'Listening…' })
@@ -42,7 +48,12 @@ export default function Present() {
     dispatch({ type: 'SET_TRANSCRIPT', payload: text })
     dispatch({ type: 'SET_SPEECH_STATE', payload: 'thinking' })
     dispatch({ type: 'SET_STATUS', payload: 'Thinking…' })
-    ws.send({ type: 'user_input', text, current_slide: currentSlideRef.current })
+    ws.send({
+      type: 'user_input',
+      text,
+      current_slide: currentSlideRef.current,
+      req_id: nextReqId(),
+    })
   }, []) // eslint-disable-line
 
   const handleSlideFinished = useCallback(() => {
@@ -55,7 +66,7 @@ export default function Present() {
     setTimeout(() => {
       if (!isAutoPresenting.current) return
       dispatch({ type: 'SET_CURRENT_SLIDE', payload: next })
-      ws.send({ type: 'navigate_request', slide: next })
+      ws.send({ type: 'navigate_request', slide: next, req_id: nextReqId() })
     }, 600)
   }, []) // eslint-disable-line
 
@@ -77,6 +88,9 @@ export default function Present() {
   })
 
   const handleWsMessage = useCallback((msg) => {
+    // Output from a turn the user already interrupted or superseded.
+    if (msg.req_id !== undefined && msg.req_id !== reqIdRef.current) return
+
     switch (msg.type) {
       case 'navigate':
         dispatch({ type: 'SET_CURRENT_SLIDE', payload: msg.slide })
@@ -97,7 +111,7 @@ export default function Present() {
         const startSlide = msg.from_slide ?? 0
         isAutoPresenting.current = true
         dispatch({ type: 'SET_CURRENT_SLIDE', payload: startSlide })
-        ws.send({ type: 'navigate_request', slide: startSlide })
+        ws.send({ type: 'navigate_request', slide: startSlide, req_id: nextReqId() })
         break
       }
       case 'speech_end':
@@ -121,14 +135,19 @@ export default function Present() {
         speech.init()
           .then(() => {
             dispatch({ type: 'SET_SPEECH_STATE', payload: 'presenting' })
-            ws.send({ type: 'start_presentation', slide: 0, slides })
+            ws.send({ type: 'start_presentation', slide: 0, slides, req_id: nextReqId() })
           })
           .catch((err) => {
             console.error('Azure Speech init failed:', err)
             dispatch({ type: 'SET_STATUS', payload: 'Voice init failed — check console' })
           })
       } else {
-        ws.send({ type: 'start_presentation', slide: currentSlideRef.current, slides })
+        ws.send({
+          type: 'start_presentation',
+          slide: currentSlideRef.current,
+          slides,
+          req_id: nextReqId(),
+        })
       }
     },
     onMessage: handleWsMessage,
@@ -138,9 +157,10 @@ export default function Present() {
   const handleSlideSelect = useCallback((idx) => {
     isAutoPresenting.current = false
     speech.stopSpeaking()
+    nextReqId()
     ws.send({ type: 'interrupt' })
     dispatch({ type: 'SET_CURRENT_SLIDE', payload: idx })
-    ws.send({ type: 'navigate_request', slide: idx })
+    ws.send({ type: 'navigate_request', slide: idx, req_id: nextReqId() })
   }, [speech, ws, dispatch])
 
   const handleExit = () => {
