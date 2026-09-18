@@ -1,3 +1,5 @@
+import asyncio
+import contextlib
 import json
 import os
 
@@ -51,21 +53,48 @@ async def generate_slides(body: dict):
     return slides
 
 
-@app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket):
-    await ws.accept()
-    session = AgentSession()
+async def _run_handler(session: AgentSession, ws: WebSocket, msg: dict):
     try:
-        while True:
-            raw = await ws.receive_text()
-            msg = json.loads(raw)
-            await session.handle(ws, msg)
-    except WebSocketDisconnect:
-        session.cancel()
+        await session.handle(ws, msg)
     except Exception as e:
         try:
             await ws.send_json({"type": "error", "message": str(e)})
         except Exception:
             pass
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket):
+    await ws.accept()
+    session = AgentSession()
+    task: asyncio.Task | None = None
+
+    async def stop_inflight():
+        """Cancel the running handler and wait for it to unwind before starting another."""
         session.cancel()
+        if task and not task.done():
+            with contextlib.suppress(Exception):
+                await task
+
+    try:
+        while True:
+            raw = await ws.receive_text()
+            msg = json.loads(raw)
+
+            # Interrupts are handled inline so they take effect mid-stream — the
+            # handler runs as a background task precisely so this loop stays free.
+            if msg.get("type") == "interrupt":
+                session.cancel()
+                continue
+
+            await stop_inflight()
+            task = asyncio.create_task(_run_handler(session, ws, msg))
+    except WebSocketDisconnect:
+        await stop_inflight()
+    except Exception as e:
+        try:
+            await ws.send_json({"type": "error", "message": str(e)})
+        except Exception:
+            pass
+        await stop_inflight()
 

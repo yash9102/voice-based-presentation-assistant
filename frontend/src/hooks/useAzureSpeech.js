@@ -3,6 +3,18 @@ import { useRef, useCallback, useEffect } from 'react'
 // Escape special XML chars in SSML
 const xmlEsc = (t) => t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 
+// VAD tuning — threshold is calibrated against the room's noise floor at init,
+// never below the floor-independent minimum.
+const VAD_MIN_THRESHOLD = 22
+const VAD_FLOOR_MARGIN = 14
+const VAD_CALIBRATION_MS = 600
+const VAD_POLL_MS = 40
+const VAD_HITS_TO_INTERRUPT = 3   // ~120ms of sustained speech, not one stray frame
+
+// Azure auth tokens live 10 minutes; refresh well inside that for both TTS and STT.
+const TOKEN_TTL_MS = 9 * 60 * 1000
+const TOKEN_REFRESH_MS = 8 * 60 * 1000
+
 export function useAzureSpeech({ onRecognized, onRecognizing, onInterrupt, onStateChange, onSlideFinished } = {}) {
   // STT (Azure Speech SDK — kept for recognition quality)
   const recognizerRef = useRef(null)
@@ -16,6 +28,7 @@ export function useAzureSpeech({ onRecognized, onRecognizing, onInterrupt, onSta
   const ttsTokenRef = useRef(null)
   const ttsRegionRef = useRef(null)
   const ttsTokenExpiryRef = useRef(0)
+  const tokenTimerRef = useRef(null)
 
   // TTS queue
   const ttsQueueRef = useRef([])
@@ -28,6 +41,8 @@ export function useAzureSpeech({ onRecognized, onRecognizing, onInterrupt, onSta
   const vadTimerRef = useRef(null)
   const micStreamRef = useRef(null)
   const vadCooldownRef = useRef(false)
+  const vadThresholdRef = useRef(VAD_MIN_THRESHOLD)
+  const vadHitsRef = useRef(0)
 
   // Stable callback refs
   const onRecognizedRef = useRef(onRecognized)
@@ -47,10 +62,14 @@ export function useAzureSpeech({ onRecognized, onRecognizing, onInterrupt, onSta
     if (Date.now() < ttsTokenExpiryRef.current - 60_000 && ttsTokenRef.current) {
       return ttsTokenRef.current
     }
-    const { token, region } = await fetch('/speech-token').then((r) => r.json())
+    const { token, region, error } = await fetch('/speech-token').then((r) => r.json())
+    if (!token) throw new Error(error || 'No speech token returned')
     ttsTokenRef.current = token
     ttsRegionRef.current = region
-    ttsTokenExpiryRef.current = Date.now() + 9 * 60 * 1000
+    ttsTokenExpiryRef.current = Date.now() + TOKEN_TTL_MS
+    // The recognizer was built with the *initial* token — without this it goes
+    // silent the moment that token expires mid-presentation.
+    if (recognizerRef.current) recognizerRef.current.authorizationToken = token
     return token
   }, [])
 
@@ -67,15 +86,38 @@ export function useAzureSpeech({ onRecognized, onRecognizing, onInterrupt, onSta
       analyserRef.current = analyser
 
       const data = new Uint8Array(analyser.frequencyBinCount)
-      const poll = () => {
+      const readLevel = () => {
         analyser.getByteFrequencyData(data)
-        const avg = data.reduce((a, b) => a + b, 0) / data.length
-        if (avg > 28 && isSpeakingRef.current && !vadCooldownRef.current) {
-          vadCooldownRef.current = true
-          onInterruptRef.current?.()
-          setTimeout(() => { vadCooldownRef.current = false }, 800)
+        return data.reduce((a, b) => a + b, 0) / data.length
+      }
+
+      // Calibrate against this room/mic before the AI starts talking, so a noisy
+      // environment doesn't self-interrupt and a quiet one stays sensitive.
+      const calibrationEnd = Date.now() + VAD_CALIBRATION_MS
+      let floorPeak = 0
+
+      const poll = () => {
+        const avg = readLevel()
+
+        if (Date.now() < calibrationEnd) {
+          floorPeak = Math.max(floorPeak, avg)
+          vadThresholdRef.current = Math.max(VAD_MIN_THRESHOLD, floorPeak + VAD_FLOOR_MARGIN)
+          vadTimerRef.current = setTimeout(poll, VAD_POLL_MS)
+          return
         }
-        vadTimerRef.current = setTimeout(poll, 40)
+
+        if (avg > vadThresholdRef.current && isSpeakingRef.current && !vadCooldownRef.current) {
+          vadHitsRef.current += 1
+          if (vadHitsRef.current >= VAD_HITS_TO_INTERRUPT) {
+            vadHitsRef.current = 0
+            vadCooldownRef.current = true
+            onInterruptRef.current?.()
+            setTimeout(() => { vadCooldownRef.current = false }, 800)
+          }
+        } else {
+          vadHitsRef.current = 0
+        }
+        vadTimerRef.current = setTimeout(poll, VAD_POLL_MS)
       }
       poll()
     } catch (e) {
@@ -217,8 +259,16 @@ export function useAzureSpeech({ onRecognized, onRecognizing, onInterrupt, onSta
     if (!SpeechSDK) throw new Error('Azure Speech SDK not loaded')
     SpeechSDKRef.current = SpeechSDK
 
-    // Mic stream for VAD
-    const micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
+    // Mic stream for VAD. STT stays open while the AI talks (that's what makes
+    // barge-in work), so AEC is required or the agent hears itself on speakers.
+    const micStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+      video: false,
+    })
     micStreamRef.current = micStream
     startVAD(micStream)
 
@@ -236,7 +286,15 @@ export function useAzureSpeech({ onRecognized, onRecognizing, onInterrupt, onSta
     speechConfig.speechRecognitionLanguage = 'en-US'
     speechConfig.setProperty('SpeechServiceConnection_RecoModelName', 'conversation')
 
-    const audioInConfig = SpeechSDK.AudioConfig.fromDefaultMicrophoneInput()
+    // Reuse the echo-cancelled stream rather than letting the SDK open a second,
+    // unconstrained mic of its own.
+    let audioInConfig
+    try {
+      audioInConfig = SpeechSDK.AudioConfig.fromStreamInput(micStream)
+    } catch (e) {
+      console.warn('fromStreamInput unavailable, falling back to default mic:', e)
+      audioInConfig = SpeechSDK.AudioConfig.fromDefaultMicrophoneInput()
+    }
     recognizerRef.current = new SpeechSDK.SpeechRecognizer(speechConfig, audioInConfig)
 
     recognizerRef.current.recognized = (_s, e) => {
@@ -248,11 +306,24 @@ export function useAzureSpeech({ onRecognized, onRecognizing, onInterrupt, onSta
       }
     }
     recognizerRef.current.sessionStopped = () => { isRecognizingRef.current = false }
+    recognizerRef.current.canceled = (_s, e) => {
+      console.warn('STT canceled:', e?.errorDetails || e?.reason)
+      isRecognizingRef.current = false
+    }
+
+    // Keep both TTS and STT tokens alive even through long silent stretches,
+    // where nothing else would call getToken().
+    clearInterval(tokenTimerRef.current)
+    tokenTimerRef.current = setInterval(() => {
+      ttsTokenExpiryRef.current = 0   // force a fetch
+      getToken().catch((e) => console.warn('Token refresh failed:', e))
+    }, TOKEN_REFRESH_MS)
   }, [startVAD, getToken])
 
   useEffect(() => {
     return () => {
       stopVAD()
+      clearInterval(tokenTimerRef.current)
       micStreamRef.current?.getTracks().forEach((t) => t.stop())
       abortCtrlRef.current?.abort()
       try { currentSourceRef.current?.stop() } catch (_) {}
