@@ -5,11 +5,11 @@ An AI-powered voice presentation tool. An AI agent narrates your slides, answers
 ## Features
 
 - **AI slide generation** — type a topic, get a 6-slide presentation in seconds
-- **Manual slide creation** — build your own slides with titles and bullet points
+- **Manual slide creation** — build your own slides with titles(heading) and bullet points
 - **Voice narration** — Azure Neural TTS (JennyNeural) reads slides naturally
 - **Interruptible** — speak at any time to stop the AI and ask a question
 - **Intelligent navigation** — AI understands your question and jumps to the right slide
-- **Continuous listening** — no push-to-talk button required
+- **Continuous listening** — no push-to-talk button required(only voice option)
 
 ## Requirements
 
@@ -74,7 +74,7 @@ FastAPI Backend
 4. Backend sets `CancellationToken.cancel()` — LLM stream exits at next chunk
 5. User's recognized speech is sent as a new `user_input` message
 
-## Voice States
+## Voice  States
 
 | State | Orb Color | Meaning |
 |-------|-----------|---------|
